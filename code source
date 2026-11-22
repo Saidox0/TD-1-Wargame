@@ -1,0 +1,181 @@
+#include <webots/robot.h>
+#include <webots/distance_sensor.h>
+#include <webots/motor.h>
+#include <math.h>
+#include <stdio.h>
+
+#define TIMESTEP 64
+#define VITESSE_MAX 6.28f
+
+// Seuils des capteurs IR (plus la valeur est grande, plus l'obstacle est proche)
+#define SEUIL_TRES_PROCHE  1000.0f
+#define SEUIL_IDEAL        400.0f
+#define SEUIL_LOIN         150.0f
+
+// Commandes angulaires de sortie
+#define CMD_DROITE    -0.4f
+#define CMD_GAUCHE     0.4f
+#define CMD_TOUT_DROIT 0.0f
+
+// Commandes de vitesse de sortie
+#define VIT_FAIBLE   3.0f
+#define VIT_MOYENNE  4.5f
+#define VIT_RAPIDE   VITESSE_MAX
+
+// --- FONCTIONS D'APPARTENANCE ---
+
+// Degre d'appartenance a l'ensemble "Proche"
+float mu_proche(float x) {
+    if (x >= SEUIL_TRES_PROCHE) return 1.0f;
+    if (x <= SEUIL_LOIN) return 0.0f;
+    return (x - SEUIL_LOIN) / (SEUIL_TRES_PROCHE - SEUIL_LOIN);
+}
+
+// Degre d'appartenance a l'ensemble "Loin"
+float mu_loin(float x) {
+    if (x <= SEUIL_LOIN) return 1.0f;
+    if (x >= SEUIL_IDEAL) return 0.0f;
+    return (SEUIL_IDEAL - x) / (SEUIL_IDEAL - SEUIL_LOIN);
+}
+
+// Degre d'appartenance a l'ensemble "Bonne distance" (fonction triangulaire)
+float mu_ideal(float x) {
+    float ecart = fabsf(x - SEUIL_IDEAL);
+    float largeur = SEUIL_IDEAL - SEUIL_LOIN;
+    if (ecart >= largeur) return 0.0f;
+    return 1.0f - (ecart / largeur);
+}
+
+// --- MOTEUR D'INFERENCE 1 : CONTROLE DE L'ORIENTATION (3 REGLES) ---
+float calculer_orientation(float dist_gauche, float dist_droite) {
+    // Fuzzification des entrees
+    float gauche_proche = mu_proche(dist_gauche);
+    float gauche_loin   = mu_loin(dist_gauche);
+    float gauche_ideale = mu_ideal(dist_gauche);
+
+    // Detection d'un mur ou coin devant/a droite (seuil critique > 700)
+    float obstacle_droite_devant = (dist_droite > 700.0f) ? 1.0f : 0.0f;
+
+    // Regle 1 : Si mur gauche trop proche OU obstacle devant/droite -> tourner a droite
+    float w1 = fmaxf(gauche_proche, obstacle_droite_devant);
+    float out1 = CMD_DROITE;
+
+    // Regle 2 : Si mur gauche trop loin (et voie libre) -> tourner a gauche pour se rapprocher
+    float w2 = fminf(gauche_loin, 1.0f - obstacle_droite_devant);
+    float out2 = CMD_GAUCHE;
+
+    // Regle 3 : Si distance ideale au mur gauche ET pas d'obstacle -> aller tout droit
+    float w3 = fminf(gauche_ideale, 1.0f - obstacle_droite_devant);
+    float out3 = CMD_TOUT_DROIT;
+
+    // Defuzzification par moyenne ponderee
+    float num = (w1 * out1) + (w2 * out2) + (w3 * out3);
+    float den = w1 + w2 + w3;
+
+    if (den < 0.0001f) return 0.0f;
+    return num / den;
+}
+
+// --- MOTEUR D'INFERENCE 2 : CONTROLE DE LA VITESSE (3 REGLES) ---
+float calculer_vitesse(float dist_gauche, float dist_droite) {
+    // On evalue la proximite maximale d'un obstacle (gauche ou droite)
+    float proximite_max = fmaxf(dist_gauche, dist_droite);
+
+    // Fuzzification du niveau de risque
+    float risque_fort   = mu_proche(proximite_max);
+    float risque_moyen  = mu_ideal(proximite_max);
+    float risque_faible = mu_loin(proximite_max);
+
+    // Regle 1 : Risque eleve -> vitesse lente
+    float w1 = risque_fort;
+    float out1 = VIT_FAIBLE;
+
+    // Regle 2 : Risque modere -> vitesse moyenne
+    float w2 = risque_moyen;
+    float out2 = VIT_MOYENNE;
+
+    // Regle 3 : Risque faible -> vitesse rapide
+    float w3 = risque_faible;
+    float out3 = VIT_RAPIDE;
+
+    // Defuzzification par moyenne ponderee
+    float num = (w1 * out1) + (w2 * out2) + (w3 * out3);
+    float den = w1 + w2 + w3;
+
+    if (den < 0.0001f) return VIT_MOYENNE;
+    return num / den;
+}
+
+// Conversion (angle, vitesse) vers vitesses des roues gauche et droite
+void calcul_vitesses_roues(float angle, float vitesse, float *v_gauche, float *v_droite) {
+    if (angle > 0.0f) {
+        // Virage a gauche : on ralentit la roue gauche
+        *v_gauche = vitesse * (1.0f - angle);
+        *v_droite = vitesse;
+    } else {
+        // Virage a droite : on ralentit la roue droite
+        *v_gauche = vitesse;
+        *v_droite = vitesse * (1.0f + angle);
+    }
+
+    // Saturation aux limites physiques des moteurs
+    if (*v_gauche > VITESSE_MAX)  *v_gauche = VITESSE_MAX;
+    if (*v_droite > VITESSE_MAX)  *v_droite = VITESSE_MAX;
+    if (*v_gauche < -VITESSE_MAX) *v_gauche = -VITESSE_MAX;
+    if (*v_droite < -VITESSE_MAX) *v_droite = -VITESSE_MAX;
+}
+
+int main(int argc, char **argv) {
+    wb_robot_init();
+
+    // Activation des 4 capteurs de distance demandes (ps1, ps2 a droite ; ps5, ps6 a gauche)
+    WbDeviceTag ps1 = wb_robot_get_device("ps1");
+    WbDeviceTag ps2 = wb_robot_get_device("ps2");
+    WbDeviceTag ps5 = wb_robot_get_device("ps5");
+    WbDeviceTag ps6 = wb_robot_get_device("ps6");
+
+    wb_distance_sensor_enable(ps1, TIMESTEP);
+    wb_distance_sensor_enable(ps2, TIMESTEP);
+    wb_distance_sensor_enable(ps5, TIMESTEP);
+    wb_distance_sensor_enable(ps6, TIMESTEP);
+
+    // Initialisation des deux moteurs de roues
+    WbDeviceTag moteur_g = wb_robot_get_device("left wheel motor");
+    WbDeviceTag moteur_d = wb_robot_get_device("right wheel motor");
+
+    wb_motor_set_position(moteur_g, INFINITY);
+    wb_motor_set_position(moteur_d, INFINITY);
+    wb_motor_set_velocity(moteur_g, 0.0);
+    wb_motor_set_velocity(moteur_d, 0.0);
+
+    printf("Demarrage du controleur flou e-puck...\n");
+
+    while (wb_robot_step(TIMESTEP) != -1) {
+        // Lecture des capteurs infrarouges
+        float val_ps1 = wb_distance_sensor_get_value(ps1);
+        float val_ps2 = wb_distance_sensor_get_value(ps2);
+        float val_ps5 = wb_distance_sensor_get_value(ps5);
+        float val_ps6 = wb_distance_sensor_get_value(ps6);
+
+        // Agregation : maximum de chaque cote (gauche et droite)
+        float dist_gauche = fmaxf(val_ps5, val_ps6);
+        float dist_droite = fmaxf(val_ps1, val_ps2);
+
+        // Calcul des commandes par inference floue
+        float angle_cible   = calculer_orientation(dist_gauche, dist_droite);
+        float vitesse_cible = calculer_vitesse(dist_gauche, dist_droite);
+
+        // Application sur les roues
+        float vg, vd;
+        calcul_vitesses_roues(angle_cible, vitesse_cible, &vg, &vd);
+        wb_motor_set_velocity(moteur_g, vg);
+        wb_motor_set_velocity(moteur_d, vd);
+
+        // Suivi en console
+        printf("Gauche: %4.0f | Droite: %4.0f => Angle: %+.2f | Vitesse: %.2f\n",
+               dist_gauche, dist_droite, angle_cible, vitesse_cible);
+    }
+
+    wb_robot_cleanup();
+    return 0;
+}
